@@ -4,6 +4,7 @@ import BaselinePanel from './components/BaselinePanel'
 import DhcpPoolPanel from './components/DhcpPoolPanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import LeaseImportPanel from './components/LeaseImportPanel'
+import MigrationPanel from './components/MigrationPanel'
 import Option121Panel from './components/Option121Panel'
 import { ReflowSummaryBar } from './components/ReflowReport'
 import ReverseDnsPanel from './components/ReverseDnsPanel'
@@ -20,6 +21,7 @@ import {
 } from './lib/baseline'
 import { downloadJson } from './lib/exporter'
 import { formatCidr, parseCidr } from './lib/ip'
+import { buildLeaseImport } from './lib/leaseImport'
 import { plan } from './lib/planner'
 import type {
   Baseline,
@@ -34,6 +36,13 @@ let counter = 0
 function uid(): string {
   counter += 1
   return `id-${Date.now()}-${counter}`
+}
+
+// 批量导入新登记的稳定 ID（App 层统一生成，导入面板与迁移编排共享同一份预览）
+let leaseCounter = 0
+function leaseUid(): string {
+  leaseCounter += 1
+  return `lease-${Date.now()}-${leaseCounter}`
 }
 
 const DEMO = {
@@ -83,6 +92,13 @@ export default function App() {
   const result = useMemo(
     () => plan({ parentCidr, reservations, requirements, baseline: reflowActive ? baseline : null }),
     [parentCidr, reservations, requirements, baseline, reflowActive],
+  )
+
+  // 静态租约批量导入的合并预览在 App 层计算一次，导入面板（应用）与迁移编排（只读）共享；
+  // CSV 文本、规划或既有登记任意变化都实时重算
+  const leaseImport = useMemo(
+    () => (result.inputErrors.length > 0 ? null : buildLeaseImport(leaseImportCsv, hostAssignments, result, leaseUid)),
+    [leaseImportCsv, hostAssignments, result],
   )
 
   // 输入非法时保留基线但暂停对比
@@ -397,7 +413,10 @@ export default function App() {
         csv={leaseImportCsv}
         onCsvChange={setLeaseImportCsv}
         onAssignmentsChange={setHostAssignments}
+        built={leaseImport}
       />
+
+      <MigrationPanel result={result} assignments={hostAssignments} imported={leaseImport} />
 
       {result.segments.length > 0 && (
         <div className="panel">

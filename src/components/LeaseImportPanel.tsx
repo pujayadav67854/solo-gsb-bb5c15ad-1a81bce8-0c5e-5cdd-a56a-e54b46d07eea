@@ -4,6 +4,7 @@ import {
   LEASE_IMPORT_SAMPLE,
   LEASE_STATUS_LABEL,
   type LeaseImportRow,
+  type LeaseImportResult,
   type LeaseImportStatus,
 } from '../lib/leaseImport'
 import { intToIp } from '../lib/ip'
@@ -15,15 +16,11 @@ interface Props {
   csv: string
   onCsvChange: (next: string) => void
   onAssignmentsChange: (next: HostAssignment[]) => void
+  /** App 层统一计算的合并预览（与迁移编排面板共享同一份结果）；缺省时由本面板自行计算 */
+  built?: LeaseImportResult | null
 }
 
 const KIND_LABEL = { fixed: '固定', auto: '自动' } as const
-
-let leaseCounter = 0
-function leaseUid(): string {
-  leaseCounter += 1
-  return `lease-${Date.now()}-${leaseCounter}`
-}
 
 const STATUS_BADGE: Record<LeaseImportStatus, string> = {
   add: 'lease-status add',
@@ -50,16 +47,19 @@ export default function LeaseImportPanel({
   csv,
   onCsvChange,
   onAssignmentsChange,
+  built: builtProp,
 }: Props) {
   const [appliedNote, setAppliedNote] = useState<string | null>(null)
 
   const invalid = result.inputErrors.length > 0
 
-  // CSV 文本、规划或既有登记任意变化都实时重算预览；原始 CSV 始终原样保留
-  const built = useMemo(
-    () => (invalid ? null : buildLeaseImport(csv, assignments, result, leaseUid)),
-    [csv, assignments, result, invalid],
+  // CSV 文本、规划或既有登记任意变化都实时重算预览；原始 CSV 始终原样保留。
+  // 优先使用 App 层共享的计算结果（迁移编排面板复用同一份合并快照）。
+  const builtFallback = useMemo(
+    () => (invalid || builtProp !== undefined ? null : buildLeaseImport(csv, assignments, result)),
+    [csv, assignments, result, invalid, builtProp],
   )
+  const built = builtProp ?? builtFallback
 
   function handleApply() {
     if (!built || !built.canApply) return

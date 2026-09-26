@@ -2250,5 +2250,394 @@ const importCsvAllNew = [
   check('规划结果不受导入影响', JSON.stringify(plan(demo)) === JSON.stringify(plan(demo)))
 }
 
+// ========== 23) 迁移执行编排 ==========
+import { buildMigrationPlan, migrationPlanText } from '../src/lib/migration'
+
+/** 测试辅助：构造无冲突合并预览（失败时抛错信息） */
+function importOrThrow(csv: string, existing: HostAssignment[], p: typeof hostPlan = hostPlan) {
+  const built = buildLeaseImport(csv, existing, p, (() => {
+    let n = 0
+    return () => `mig-new-${++n}`
+  })())
+  if (!built.canApply) throw new Error(`测试前置：CSV 预览存在冲突: ${JSON.stringify(built.rows.map((r) => r.errors))}`)
+  return built
+}
+
+/** 模拟逐步执行清单，校验每一步都不产生瞬时重复 IPv4；返回执行后的地址->设备集合。
+ *  initial 可传入不参与迁移（无变化）的初始占用设备，使终态校验覆盖全网。 */
+function simulateNoTransientDup(
+  steps: ReturnType<typeof buildMigrationPlan>['steps'],
+  initial: HostAssignment[] = [],
+): Map<number, string[]> {
+  const occupied = new Map<number, string[]>()
+  for (const a of initial) {
+    const list = occupied.get(a.address) ?? []
+    list.push(a.id)
+    occupied.set(a.address, list)
+  }
+  for (const s of steps) {
+    const from = s.fromAddress
+    if (from !== undefined) {
+      const list = occupied.get(from) ?? []
+      const idx = list.indexOf(s.deviceId)
+      if (idx >= 0) list.splice(idx, 1)
+      occupied.set(from, list)
+    }
+    // 进入目标地址前，该地址不得被其他设备占用（核心不变量：无瞬时重复）
+    const current = occupied.get(s.address) ?? []
+    check(
+      `步骤 ${s.order}（${s.name}）迁入 ${intToIp(s.address)} 前该地址无其他设备`,
+      current.length === 0,
+      `地址 ${intToIp(s.address)} 当前被 ${current.join(',')} 占用`,
+    )
+    occupied.set(s.address, [...current, s.deviceId])
+  }
+  return occupied
+}
+
+// 23a) 无变化：零步骤、ok
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '设备A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,设备A,192.168.10.17,aa:bb:cc:00:00:01'].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('无变化迁移：ok 且零步骤、零设备', mp.ok && mp.steps.length === 0 && mp.changedDevices === 0, JSON.stringify(mp.counts))
+  check('无变化时复制文本为空', migrationPlanText(mp) === '')
+}
+
+// 23b) 单设备迁入空闲地址：直接一步迁移
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '设备A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.32/27,设备A,192.168.10.40,aa:bb:cc:00:00:01'].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('空闲改址：1 步迁移、无环', mp.ok && mp.steps.length === 1 && mp.steps[0].kind === 'move' && mp.counts.cycles === 0, JSON.stringify(mp.steps))
+  check('步骤含原/目标地址与原因', mp.steps[0].fromAddress === ipToInt('192.168.10.17') && mp.steps[0].address === ipToInt('192.168.10.40') && /当前空闲/.test(mp.steps[0].reason))
+}
+
+// 23c) 依赖链 A@.40→.41（B 占用）、B@.41→.50：顺序必须 B 先 A 后
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.50,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('依赖链：两步迁移、无环', mp.ok && mp.steps.length === 2 && mp.counts.cycles === 0, JSON.stringify(mp.counts))
+  check('顺序：B（.41→.50）先迁、A（.40→.41）后迁', mp.steps[0].deviceId === 'b' && mp.steps[1].deviceId === 'a', mp.steps.map((s) => [s.deviceId, s.kind]).join(','))
+  check('A 的步骤原因说明 B 已迁出', /B/.test(mp.steps[1].reason) && /已迁出/.test(mp.steps[1].reason))
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23d) 两设备互换（2 环）：临时锚点先迁出 -> 完成互换 -> 锚点完成环路并释放临时地址
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('互换识别为 1 个环', mp.ok && mp.counts.cycles === 1 && mp.cycles[0].blocked === false, JSON.stringify(mp.cycles))
+  check('共 3 步：临时迁出 -> 迁移 -> 完成环路', mp.steps.length === 3 &&
+    mp.steps[0].kind === 'temp-move' && mp.steps[1].kind === 'move' && mp.steps[2].kind === 'cycle-complete',
+    mp.steps.map((s) => s.kind).join(','))
+  // 锚点按原地址升序选 A（.40 < .41），临时地址为原网段排除占用(.40/.41)与目标(.40/.41)后的最低地址 .33
+  check('锚点为 A，临时地址为原网段最低空闲 .33', mp.steps[0].deviceId === 'a' && mp.steps[0].address === ipToInt('192.168.10.33') &&
+    mp.steps[0].tempCidr === '192.168.10.32/27', intToIp(mp.steps[0].address))
+  check('第 2 步 B .41→.40，第 3 步 A .33→.41（临时地址释放）',
+    mp.steps[1].deviceId === 'b' && mp.steps[1].address === ipToInt('192.168.10.40') &&
+      mp.steps[2].deviceId === 'a' && mp.steps[2].fromAddress === ipToInt('192.168.10.33') &&
+      mp.steps[2].address === ipToInt('192.168.10.41'),
+  )
+  const final = simulateNoTransientDup(mp.steps)
+  check('互换结束：.40=B、.41=A，临时地址 .33 已释放',
+    (final.get(ipToInt('192.168.10.40')) ?? []).join() === 'b' &&
+      (final.get(ipToInt('192.168.10.41')) ?? []).join() === 'a' &&
+      (final.get(ipToInt('192.168.10.33')) ?? []).length === 0,
+    JSON.stringify([...final.entries()].map(([addr, ids]) => [intToIp(addr), ids])),
+  )
+  check('清单文本含表头与全部 3 步及临时地址列', /步骤\t操作\t设备\t原地址\t目标地址\t临时地址/.test(migrationPlanText(mp)) &&
+    /192\.168\.10\.33/.test(migrationPlanText(mp)))
+}
+
+// 23e) 三设备环路：40→41、41→42、42→40，同样可解开
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.42'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.42,aa:bb:cc:00:00:02',
+    '192.168.10.32/27,C,192.168.10.40,aa:bb:cc:00:00:03',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('三环：4 步（1 临时 + 2 迁移 + 1 完成）', mp.ok && mp.steps.length === 4 && mp.counts.cycles === 1, mp.steps.map((s) => s.kind).join(','))
+  check('锚点 A 临时迁到 .33', mp.steps[0].deviceId === 'a' && mp.steps[0].address === ipToInt('192.168.10.33'))
+  const order = mp.steps.slice(1).map((s) => s.deviceId).join(',')
+  check('随后顺序 C(.42→.40) → B(.41→.42) → A 完成(.33→.41)', order === 'c,b,a', order)
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23f) 新建设备上线：目标空闲即一步 add；目标被将迁走设备占用则排在其后
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q3', name: '老设备', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,老设备,192.168.10.50,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,新设备,192.168.10.40,aa:bb:cc:00:00:09',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('先迁老设备、再新增上线', mp.ok && mp.steps.length === 2 &&
+    mp.steps[0].kind === 'move' && mp.steps[0].deviceId === 'h1' &&
+    mp.steps[1].kind === 'add' && mp.steps[1].address === ipToInt('192.168.10.40'),
+  mp.steps.map((s) => [s.kind, s.deviceId]).join(','))
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23g) 目标地址被不会迁走的既有设备物理占住 -> 阻止且不产生步骤。
+//  有效登记占位在导入阶段就会被判为 CSV 冲突；这里能穿过无冲突预览的只有【失效的未更新登记】
+//  （ownerId=q4 但地址 .40 落在 q3 网段，reconcile 判越界，导入快照不拦），迁移编排必须物理性拦截。
+{
+  const existing: HostAssignment[] = [
+    { id: 'ghost', ownerId: 'q4', name: '失效越界设备', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:11:11:11' },
+  ]
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.32/27,新设备,192.168.10.40,aa:bb:cc:00:00:09'].join('\n')
+  const imported = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('前置：导入预览可通过（失效登记不在 q3 快照查重口径内）', imported.canApply, JSON.stringify(imported.rows.map((r) => r.errors)))
+  const mp = buildMigrationPlan(imported, existing, hostPlan)
+  check('被不会迁走的设备物理占址：ok=false、零步骤、阻断项点名设备',
+    !mp.ok && mp.steps.length === 0 && mp.blockers.length === 1 &&
+      mp.blockers[0].kind === 'occupied' && /失效越界设备/.test(mp.blockers[0].message) &&
+      mp.blockers[0].address === ipToInt('192.168.10.40'),
+    JSON.stringify(mp.blockers))
+  check('阻断时复制文本为空', migrationPlanText(mp) === '')
+}
+
+// 23h) 满配 /30 两设备互换：无可用临时地址 -> 明确阻止该环
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q4', name: '管理A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q4', name: '管理B', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.18,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,管理B,192.168.10.17,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('/30 满配互换：环被标记 blocked、整体阻止',
+    !mp.ok && mp.steps.length === 0 && mp.cycles.length === 1 && mp.cycles[0].blocked === true,
+    JSON.stringify(mp.cycles))
+  check('阻断原因说明原网段无空闲临时地址并给出可用范围',
+    mp.blockers.some((b) => b.kind === 'no-temp' && /192\.168\.10\.17 ~ 192\.168\.10\.18/.test(b.message) && /管理A|管理B/.test(b.message)),
+    mp.blockers.map((b) => b.message).join('|'))
+}
+
+// 23i) /30 互换但有第三个未占满的同段地址空间（用 /29 六可用，占两址互换仍有四个临时候选）
+{
+  const p29 = plan({
+    parentCidr: '10.9.0.0/29',
+    reservations: [],
+    requirements: [{ id: 's', name: '小段', hosts: 6, cidr: '10.9.0.0/29' }],
+  })
+  check('/29 规划成功（可用 .1~.6）', p29.inputErrors.length === 0 && p29.segments.some((x) => x.cidr === '10.9.0.0/29'))
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 's', name: 'A', address: ipToInt('10.9.0.1'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 's', name: 'B', address: ipToInt('10.9.0.2'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '10.9.0.0/29,A,10.9.0.2,aa:bb:cc:00:00:01',
+    '10.9.0.0/29,B,10.9.0.1,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing, p29), existing, p29)
+  check('/29 互换可解：临时地址为排除占用/目标后的最低 .3', mp.ok && mp.steps[0].address === ipToInt('10.9.0.3'),
+    mp.ok ? intToIp(mp.steps[0].address) : mp.blockers.map((b) => b.message).join('|'))
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23j) 临时地址必须排除全部目标地址：环内设备原网段虽有空闲，但空闲地址恰是其他设备目标 -> 取其后
+{
+  // /29 .1~.6；环 A@.1→.2、B@.2→.1；另有设备 C 的目标恰为 .3（从 .4 迁入），D 目标 .4（从 .3 迁入）形成第二环。
+  // 两环互相占用：第一环的临时候选不得取 .3/.4（第二环目标/占用），应为 .5
+  const p29 = plan({
+    parentCidr: '10.8.0.0/29',
+    reservations: [],
+    requirements: [{ id: 's', name: '小段', hosts: 6, cidr: '10.8.0.0/29' }],
+  })
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 's', name: 'A', address: ipToInt('10.8.0.1'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 's', name: 'B', address: ipToInt('10.8.0.2'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 's', name: 'C', address: ipToInt('10.8.0.3'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+    { id: 'd', ownerId: 's', name: 'D', address: ipToInt('10.8.0.4'), mode: 'manual', mac: 'aa:bb:cc:00:00:04' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '10.8.0.0/29,A,10.8.0.2,aa:bb:cc:00:00:01',
+    '10.8.0.0/29,B,10.8.0.1,aa:bb:cc:00:00:02',
+    '10.8.0.0/29,C,10.8.0.4,aa:bb:cc:00:00:03',
+    '10.8.0.0/29,D,10.8.0.3,aa:bb:cc:00:00:04',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing, p29), existing, p29)
+  check('两个互不相连的互换环都可解（各 3 步，共 6 步）', mp.ok && mp.counts.cycles === 2 && mp.steps.length === 6,
+    mp.ok ? mp.steps.map((s) => s.kind).join(',') : mp.blockers.map((x) => x.message).join('|'))
+  const temps = mp.steps.filter((s) => s.kind === 'temp-move').map((s) => intToIp(s.address)).sort()
+  check('两个临时地址为排除占用+全部目标后的 .5 与 .6', JSON.stringify(temps) === JSON.stringify(['10.8.0.5', '10.8.0.6']), JSON.stringify(temps))
+  const final = simulateNoTransientDup(mp.steps)
+  check('两环结束后最终占用正确且临时地址已释放',
+    (final.get(ipToInt('10.8.0.1')) ?? []).join() === 'b' &&
+      (final.get(ipToInt('10.8.0.2')) ?? []).join() === 'a' &&
+      (final.get(ipToInt('10.8.0.3')) ?? []).join() === 'd' &&
+      (final.get(ipToInt('10.8.0.4')) ?? []).join() === 'c' &&
+      (final.get(ipToInt('10.8.0.5')) ?? []).length === 0 &&
+      (final.get(ipToInt('10.8.0.6')) ?? []).length === 0,
+  )
+}
+
+// 23k) 冲突预览 / 不可应用时不产生结果
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q3', name: '留守者', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:11:11:11' },
+  ]
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.32/27,新设备,192.168.10.40,aa:bb:cc:00:00:09'].join('\n')
+  const conflicted = buildLeaseImport(csv, existing, hostPlan, () => 'x') // 与未更新设备冲突
+  check('前置：该预览确有冲突', !conflicted.canApply && conflicted.hasConflicts)
+  const mp = buildMigrationPlan(conflicted, existing, hostPlan)
+  check('冲突预览：ok=false、零步骤', !mp.ok && mp.steps.length === 0 && mp.blockers[0].kind === 'pending')
+}
+
+// 23l) 跨网段互换（q3 的两台设备互改地址属于同段；构造跨网段环：
+//  A:q3@.40 -> q3? 跨段环需要 A 的目标是 B 的原址、B 的目标是 A 的原址，而原址分属不同网段时
+//  目标网段也随之交换——A 迁入 B 的原网段、B 迁入 A 的原网段，仍构成依赖环）
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' }, // 32/27
+    { id: 'b', ownerId: 'q2', name: 'B', address: ipToInt('192.168.10.100'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' }, // 64/26
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    // A 迁入 B 的原网段占用 .100；B 迁入 A 的原网段占用 .40
+    '192.168.10.64/26,A,192.168.10.100,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('跨网段互换识别为环并可解', mp.ok && mp.counts.cycles === 1 && mp.steps.length === 3,
+    mp.ok ? mp.steps.map((s) => [s.kind, s.deviceId]).join(',') : mp.blockers.map((x) => x.message).join('|'))
+  // 锚点 A 原网段 32/27 内排除占用(.40)与全部目标(.100/.40)后的最低地址为 .33
+  check('锚点 A 的临时地址在其原网段 32/27（.33）', mp.steps[0].deviceId === 'a' &&
+    mp.steps[0].address === ipToInt('192.168.10.33') && mp.steps[0].tempCidr === '192.168.10.32/27')
+  check('最终 A 在 q2 的 .100、B 在 q3 的 .40', mp.steps[1].deviceId === 'b' && mp.steps[2].deviceId === 'a',
+    mp.steps.map((s) => [s.deviceId, intToIp(s.address)]).join(','))
+  simulateNoTransientDup(mp.steps)
+}
+
+// 23m) 只读隔离：编排不修改既有登记与合并快照
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const imported = importOrThrow(csv, existing)
+  const snapE = JSON.stringify(existing)
+  const snapM = JSON.stringify(imported.merged)
+  buildMigrationPlan(imported, existing, hostPlan)
+  check('编排过程不改写既有登记与合并快照', JSON.stringify(existing) === snapE && JSON.stringify(imported.merged) === snapM)
+}
+
+// 23n) 环与依赖链混合：A⇄B 互换（40/41），C@.42→.40 依赖 B 离开，D@.43→.55 空闲直迁
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.42'), mode: 'manual', mac: 'aa:bb:cc:00:00:03' },
+    { id: 'd', ownerId: 'q3', name: 'D', address: ipToInt('192.168.10.43'), mode: 'manual', mac: 'aa:bb:cc:00:00:04' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+    '192.168.10.32/27,C,192.168.10.42,aa:bb:cc:00:00:03', // 无变化，不应产生步骤
+    '192.168.10.32/27,D,192.168.10.55,aa:bb:cc:00:00:04',
+  ].join('\n')
+  const mp = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('混合场景：1 环、共 4 步（环的 3 步 + D 的空闲迁移），C 无变化不出现',
+    mp.ok && mp.counts.cycles === 1 && mp.steps.length === 4 && !mp.steps.some((s) => s.deviceId === 'c'),
+    mp.steps.map((s) => [s.deviceId, s.kind]).join(','))
+  // 第 1 步必为锚点 A 临时迁出；之后 B 目标 .40 腾空先迁、A 完成环路到 .41；
+  // D 目标 .55 虽空闲，但每轮最低目标优先：.40/.41 均早于 .55
+  check('顺序：A 临时迁出 → B 迁移 → A 完成环路 → D 空闲迁移',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(',') === 'a:temp-move,b:move,a:cycle-complete,d:move',
+    mp.steps.map((s) => `${s.deviceId}:${s.kind}`).join(','))
+  const final = simulateNoTransientDup(mp.steps, [
+    // C 无变化，模拟中作为始终在线的初始占用者
+    { id: 'c', ownerId: 'q3', name: 'C', address: ipToInt('192.168.10.42'), mode: 'manual' },
+  ])
+  check('混合场景终态正确：A=.41 B=.40 C=.42 D=.55，临时 .33 释放',
+    (final.get(ipToInt('192.168.10.40')) ?? []).join() === 'b' &&
+      (final.get(ipToInt('192.168.10.41')) ?? []).join() === 'a' &&
+      (final.get(ipToInt('192.168.10.42')) ?? []).join() === 'c' &&
+      (final.get(ipToInt('192.168.10.55')) ?? []).join() === 'd' &&
+      (final.get(ipToInt('192.168.10.33')) ?? []).length === 0,
+  )
+}
+
+// 23o) 实时重算：同一 CSV 下登记被应用（现状=目标）后，清单立即变为零步骤
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q3', name: 'A', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'b', ownerId: 'q3', name: 'B', address: ipToInt('192.168.10.41'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.32/27,A,192.168.10.41,aa:bb:cc:00:00:01',
+    '192.168.10.32/27,B,192.168.10.40,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const before = buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan)
+  check('应用前：互换环存在（3 步）', before.ok && before.counts.cycles === 1 && before.steps.length === 3)
+  // 应用导入：现状即合并快照
+  const applied = importOrThrow(csv, existing).merged
+  const afterImport = buildLeaseImport(csv, applied, hostPlan, () => 'x')
+  check('应用后预览全部无变化', afterImport.canApply && afterImport.counts.unchanged === 2)
+  const after = buildMigrationPlan(afterImport, applied, hostPlan)
+  check('应用后实时重算为零步骤', after.ok && after.steps.length === 0 && after.changedDevices === 0)
+}
+
+// 23p) 规划变化后实时重算：网段迁移导致原 CSV 冲突 -> 不产生结果；恢复后重新可编排
+{
+  const existing: HostAssignment[] = [
+    { id: 'a', ownerId: 'q4', name: '管理A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,管理A,192.168.10.18,aa:bb:cc:00:00:01'].join('\n')
+  check('原规划下可编排（1 步迁移）', buildMigrationPlan(importOrThrow(csv, existing), existing, hostPlan).steps.length === 1)
+  const moved = buildLeaseImport(csv, existing, migratedPlan, () => 'x')
+  check('规划迁移后预览转为冲突', !moved.canApply && moved.hasConflicts)
+  check('迁移编排随之不产生结果（pending、零步骤）', (() => {
+    const mp = buildMigrationPlan(moved, existing, migratedPlan)
+    return !mp.ok && mp.steps.length === 0 && mp.blockers[0].kind === 'pending'
+  })())
+  const fixedCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.20/30,管理A,192.168.10.22,aa:bb:cc:00:00:01'].join('\n')
+  check('改到新网段后恢复编排', buildMigrationPlan(importOrThrow(fixedCsv, existing, migratedPlan), existing, migratedPlan).steps.length === 1)
+}
+
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)
