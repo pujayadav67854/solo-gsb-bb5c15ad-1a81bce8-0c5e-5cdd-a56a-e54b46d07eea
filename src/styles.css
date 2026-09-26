@@ -1629,3 +1629,66 @@ tr.rdns-skip-row td {
   color: #6ee7b7;
   font-size: 13px;
 }
+
+/* ========== ⑪ 迁移执行编排 ========== */
+
+.migration-table .mig-seq {
+  width: 46px;
+  color: var(--muted);
+}
+
+.migration-table .mig-cidr {
+  white-space: nowrap;
+}
+
+.mig-reason {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+  min-width: 260px;
+}
+
+.mig-step {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.mig-step.move {
+  background: rgba(56, 189, 248, 0.16);
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
+.mig-step.add {
+  background: rgba(52, 211, 153, 0.16);
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.4);
+}
+
+.mig-step.temp {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fcd34d;
+  border-color: rgba(251, 191, 36, 0.4);
+}
+
+.mig-step.final {
+  background: rgba(192, 132, 252, 0.18);
+  color: #d8b4fe;
+  border-color: rgba(192, 132, 252, 0.45);
+}
+
+.mig-temp-ip {
+  color: #fcd34d;
+}
+
+tr.mig-row-temp td {
+  background: rgba(251, 191, 36, 0.05);
+}
+
+tr.mig-row-final td {
+  background: rgba(192, 132, 252, 0.05);
+}

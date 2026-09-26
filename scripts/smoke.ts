@@ -18,6 +18,7 @@ import {
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
 import { buildDhcpPool, resolvePoolSegment } from '../src/lib/dhcpPool'
 import { buildLeaseImport, mapHeader, parseCsv } from '../src/lib/leaseImport'
+import { buildMigration, migrationPlanText } from '../src/lib/migration'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
@@ -2248,6 +2249,224 @@ const importCsvAllNew = [
   buildLeaseImport(csv, existing, hostPlan, () => 'x')
   check('预览计算不改写既有登记数组', JSON.stringify(existing) === snapshot && existing[0].ownerId === 'q4')
   check('规划结果不受导入影响', JSON.stringify(plan(demo)) === JSON.stringify(plan(demo)))
+}
+
+// ========== 23) 迁移执行编排 ==========
+
+/**
+ * 按迁移步骤模拟执行：每一步完成后断言
+ * ① 在线地址全局唯一（无瞬时重复 IPv4）② 迁移结束后每台设备落在其合并快照目标地址。
+ */
+function simulateMigration(
+  before: HostAssignment[],
+  steps: ReturnType<typeof buildMigration>['steps'],
+  after: HostAssignment[],
+): boolean {
+  const live = new Map<string, number>()
+  for (const a of before) if (!live.has(a.id)) live.set(a.id, a.address)
+  for (const s of steps) {
+    live.set(s.deviceId, s.address)
+    const seen = new Set<number>()
+    for (const addr of live.values()) {
+      if (seen.has(addr)) return false
+      seen.add(addr)
+    }
+  }
+  for (const a of after) {
+    if (live.get(a.id) !== a.address) return false
+  }
+  return live.size === after.length
+}
+
+// 迁移测试专用规划：/27 网段（32~63，可用 .33~.62，临时地址空间充足）
+const migPlan = plan({
+  parentCidr: '192.168.10.0/24',
+  reservations: [],
+  requirements: [{ id: 's1', name: '迁移测试段', hosts: 25, cidr: '192.168.10.32/27' }],
+})
+const migCidr = '192.168.10.32/27'
+function h(id: string, name: string, lastOctet: number, macSuffix: string): HostAssignment {
+  return {
+    id,
+    ownerId: 's1',
+    name,
+    address: ipToInt(`192.168.10.${lastOctet}`),
+    mode: 'manual',
+    mac: `aa:bb:cc:00:00:${macSuffix}`,
+  }
+}
+
+// 23a) 无环改址：两台设备都迁向当前空闲地址，按地址升序的拓扑序执行
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02')]
+  const merged = [h('a', '设备A', 40, '01'), h('b', '设备B', 41, '02')]
+  const m = buildMigration(existing, merged, migPlan)
+  check('无环迁移状态 ready', m.status === 'ready', m.message)
+  check('无环迁移 2 台设备、0 环、2 步', m.counts.devices === 2 && m.counts.cycles === 0 && m.steps.length === 2, JSON.stringify(m.counts))
+  check('步骤类型均为 move', m.steps.every((s) => s.kind === 'move'))
+  check('拓扑序：旧地址低者先执行（A .33->.40 先于 B .34->.41）',
+    m.steps[0].deviceId === 'a' && m.steps[0].ip === '192.168.10.40' && m.steps[1].deviceId === 'b',
+    m.steps.map((s) => [s.deviceId, s.fromIp, s.ip]).join(' | '))
+  check('全程无瞬时重复地址且最终落在目标', simulateMigration(existing, m.steps, merged))
+  check('move 步记录释放地址', m.steps[0].releasedIp === '192.168.10.33')
+}
+
+// 23b) 无环链：A .33->.50（空闲），B .34->.33（等 A 释放）-> A 必须先执行
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02')]
+  const merged = [h('a', '设备A', 50, '01'), h('b', '设备B', 33, '02')]
+  const m = buildMigration(existing, merged, migPlan)
+  check('链式迁移 ready', m.status === 'ready', m.message)
+  check('A（迁入空闲 .50）先于依赖它释放 .33 的 B',
+    m.steps[0].deviceId === 'a' && m.steps[1].deviceId === 'b' && m.steps[1].ip === '192.168.10.33',
+    m.steps.map((s) => [s.deviceId, s.fromIp, s.ip]).join(' | '))
+  check('B 的原因引用 A 的步骤序号', /第 1 步/.test(m.steps[1].reason), m.steps[1].reason)
+  check('链式迁移全程无瞬时重复', simulateMigration(existing, m.steps, merged))
+}
+
+// 23c) 互换地址（2 环）：A .33<->B .34，临时地址为原网段最低可用 .35（排除全部目标与当前占用）
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02')]
+  const merged = [h('a', '设备A', 34, '01'), h('b', '设备B', 33, '02')]
+  const m = buildMigration(existing, merged, migPlan)
+  check('互换迁移 ready', m.status === 'ready', m.message)
+  check('识别为 1 个环、2 台设备、3 步（临时/改址/闭合）',
+    m.counts.cycles === 1 && m.counts.acyclic === 0 && m.steps.length === 3,
+    JSON.stringify(m.counts))
+  const [t, mv, fin] = m.steps
+  check('第 1 步：旧地址最低的 A 临时迁到 .35',
+    t.kind === 'temp' && t.deviceId === 'a' && t.ip === '192.168.10.35' && t.cycle === 1 && t.fromIp === '192.168.10.33',
+    JSON.stringify(t))
+  check('临时地址避开当前占用（.33/.34）与全部目标（.33/.34）', t.ip === '192.168.10.35')
+  check('第 2 步：B 从 .34 迁到被让出的 .33',
+    mv.kind === 'move' && mv.deviceId === 'b' && mv.fromIp === '192.168.10.34' && mv.ip === '192.168.10.33',
+    JSON.stringify(mv))
+  check('第 3 步：A 从临时 .35 迁到目标 .34 并释放临时地址',
+    fin.kind === 'final' && fin.deviceId === 'a' && fin.ip === '192.168.10.34' && fin.tempIp === '192.168.10.35' &&
+      fin.releasedIp === '192.168.10.35',
+    JSON.stringify(fin))
+  check('互换迁移全程无瞬时重复且最终地址正确', simulateMigration(existing, m.steps, merged))
+  const text = migrationPlanText(m)
+  check('复制清单为 TSV 且含表头与 3 步', /步骤\t环\t操作/.test(text) && text.trim().split('\n').length === 4)
+}
+
+// 23d) 多设备环（3 环）：A .33->.34、B .34->.35、C .35->.33；最低临时可用为 .36
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02'), h('c', '设备C', 35, '03')]
+  const merged = [h('a', '设备A', 34, '01'), h('b', '设备B', 35, '02'), h('c', '设备C', 33, '03')]
+  const m = buildMigration(existing, merged, migPlan)
+  check('3 设备环 ready、1 环 4 步', m.status === 'ready' && m.steps.length === 4, m.message)
+  const kinds = m.steps.map((s) => s.kind).join(',')
+  check('步骤结构 temp -> move -> move -> final', kinds === 'temp,move,move,final', kinds)
+  check('pivot 为旧地址最低的 A，临时地址 .36',
+    m.steps[0].deviceId === 'a' && m.steps[0].ip === '192.168.10.36',
+    JSON.stringify(m.steps[0]))
+  check('环内顺序 C(.35->.33) 然后 B(.34->.35)',
+    m.steps[1].deviceId === 'c' && m.steps[1].ip === '192.168.10.33' &&
+      m.steps[2].deviceId === 'b' && m.steps[2].ip === '192.168.10.35',
+    m.steps.slice(1, 3).map((s) => [s.deviceId, s.ip]).join(' | '))
+  check('3 设备环全程无瞬时重复', simulateMigration(existing, m.steps, merged))
+}
+
+// 23e) /30 互换：网段可用地址恰好被两台设备占满且二者互为目标 -> 无临时地址，明确阻止
+{
+  const tightExisting: HostAssignment[] = [
+    { id: 't1', ownerId: 'q4', name: '管理A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:11' },
+    { id: 't2', ownerId: 'q4', name: '管理B', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:12' },
+  ]
+  const tightMerged: HostAssignment[] = [
+    { ...tightExisting[0], address: ipToInt('192.168.10.18') },
+    { ...tightExisting[1], address: ipToInt('192.168.10.17') },
+  ]
+  const m = buildMigration(tightExisting, tightMerged, hostPlan)
+  check('/30 互换无临时地址 -> blocked', m.status === 'blocked' && m.steps.length === 0, m.status)
+  check('阻止信息列出 1 个环及 2 台设备的逐设备原因',
+    m.blockedCycles.length === 1 && m.blockedCycles[0].members.length === 2 &&
+      m.blockedCycles[0].reasons.length === 2 &&
+      m.blockedCycles[0].reasons.every((r) => /没有同时避开/.test(r.message)),
+    JSON.stringify(m.blockedCycles))
+  check('阻止时复制文本为空', migrationPlanText(m) === '')
+}
+
+// 23f) 新增设备：目标空闲 -> 单步 add；与无环改址混合时按拓扑序交错
+{
+  const existing = [h('a', '设备A', 33, '01')]
+  const merged = [
+    h('a', '设备A', 50, '01'),
+    h('n', '新设备', 34, '09'),
+  ]
+  const m = buildMigration(existing, merged, migPlan)
+  check('混合新增 ready、2 步', m.status === 'ready' && m.steps.length === 2 && m.counts.adds === 1, JSON.stringify(m.counts))
+  check('新增步骤类型 add 且无原地址 / 无释放',
+    m.steps.some((s) => s.kind === 'add' && s.deviceId === 'n' && s.fromIp === undefined && s.releasedAddress === undefined))
+  check('混合场景全程无瞬时重复', simulateMigration(existing, m.steps, merged))
+}
+
+// 23g) 无变化合并 -> idle，不生成步骤
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02')]
+  const m = buildMigration(existing, existing.map((x) => ({ ...x })), migPlan)
+  check('无地址变化 -> idle', m.status === 'idle' && m.steps.length === 0 && m.devices.length === 0, m.status)
+}
+
+// 23h) 端到端：无冲突 CSV 互换 -> buildLeaseImport.merged -> buildMigration 直接可编排
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '管理设备1', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    // h1 从 q4 跨网段迁到 q1 的空闲地址（无环）
+    '192.168.10.128/25,管理设备1,192.168.10.200,aa:bb:cc:00:00:01',
+    // 两台新设备落在办公段空闲地址
+    '192.168.10.128/25,新增设备2,192.168.10.201,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const built = buildLeaseImport(csv, existing, hostPlan, (() => {
+    let n = 0
+    return () => `new-${++n}`
+  })())
+  check('端到端 CSV 可应用', built.canApply, JSON.stringify(built.counts))
+  const m = buildMigration(existing, built.merged, hostPlan)
+  check('端到端迁移 ready、2 步（1 改址 + 1 新增）',
+    m.status === 'ready' && m.steps.length === 2 &&
+      m.steps.some((s) => s.kind === 'move' && s.deviceName === '管理设备1') &&
+      m.steps.some((s) => s.kind === 'add' && s.deviceName === '新增设备2'),
+    m.message)
+  check('跨网段标记与原因文本正确',
+    m.devices.find((d) => d.id === 'h1')?.crossSegment === true &&
+      m.steps.some((s) => /跨网段/.test(s.reason)),
+    m.steps.map((s) => s.reason).join(' / '))
+  check('端到端全程无瞬时重复', simulateMigration(existing, m.steps, built.merged))
+}
+
+// 23i) 同段互换但最低空闲地址恰为某设备目标地址时，临时地址必须跳过该目标
+//  A .33<->B .34；另有 C .35->.36（.35 腾出后 .36 是 C 目标），互换环的临时地址不得选 .36
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02'), h('c', '设备C', 35, '03')]
+  const merged = [h('a', '设备A', 34, '01'), h('b', '设备B', 33, '02'), h('c', '设备C', 36, '03')]
+  const m = buildMigration(existing, merged, migPlan)
+  check('互换环 + 独立改址混合 ready', m.status === 'ready', m.message)
+  const tempStep = m.steps.find((s) => s.kind === 'temp')!
+  check('临时地址排除当前占用（.33/.34/.35）与全部目标（.33/.34/.36）-> 选 .37',
+    tempStep.ip === '192.168.10.37',
+    `临时地址=${tempStep.ip}，步骤=${m.steps.map((s) => `${s.deviceName}:${s.fromIp}->${s.ip}`).join(' | ')}`)
+  check('混合场景模拟执行无瞬时重复', simulateMigration(existing, m.steps, merged))
+}
+
+// 23j) 实时重算与只读：登记 / CSV / 规划变化后重算；编排不改写任何输入
+{
+  const existing = [h('a', '设备A', 33, '01'), h('b', '设备B', 34, '02')]
+  const swapped = [h('a', '设备A', 34, '01'), h('b', '设备B', 33, '02')]
+  const snapshot = JSON.stringify(existing)
+  const m1 = buildMigration(existing, swapped, migPlan)
+  check('编排计算不改写既有登记', JSON.stringify(existing) === snapshot)
+  // 登记变化（B 提前移走）后互换环消失，变为无环
+  const existing2 = [h('a', '设备A', 33, '01'), h('b', '设备B', 40, '02')]
+  const m2 = buildMigration(existing2, swapped, migPlan)
+  check('占用关系变化后实时重算：A->.34 不再成环（目标空闲）',
+    m2.status === 'ready' && m2.counts.cycles === 0 && m2.counts.acyclic === 2,
+    JSON.stringify(m2.counts))
+  void m1
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)

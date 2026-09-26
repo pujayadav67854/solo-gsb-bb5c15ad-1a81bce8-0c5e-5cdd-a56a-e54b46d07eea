@@ -4,6 +4,7 @@ import BaselinePanel from './components/BaselinePanel'
 import DhcpPoolPanel from './components/DhcpPoolPanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import LeaseImportPanel from './components/LeaseImportPanel'
+import MigrationPanel from './components/MigrationPanel'
 import Option121Panel from './components/Option121Panel'
 import { ReflowSummaryBar } from './components/ReflowReport'
 import ReverseDnsPanel from './components/ReverseDnsPanel'
@@ -398,6 +399,8 @@ export default function App() {
         onCsvChange={setLeaseImportCsv}
         onAssignmentsChange={setHostAssignments}
       />
+
+      <MigrationPanel result={result} assignments={hostAssignments} csv={leaseImportCsv} />
 
       {result.segments.length > 0 && (
         <div className="panel">
